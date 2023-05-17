@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${APPD_CONFIG_MAP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APPLICATION_NAME}
+    color: ${COLOR}
+data:
+  CONTROLLER_HOST: "moodys-test.saas.appdynamics.com"
+  CONTROLLER_PORT: "443"
+  CONTROLLER_SSL_ENABLED: "true"
+  ACCOUNT_ACCESS_KEY: "0pd7klt6r82g"
+  ACCOUNT_NAME: "moodys-test"
+  APPLICATION_NAME: "daw-uat"
+  TIER_NAME: "${APPLICATION_NAME}-${AWS_REGION}"
+  JAVA_AGENT_REUSE_NODE_NAME: "true"
+  JAVA_AGENT_REUSE_NODE_NAME_PREFIX: "pod"

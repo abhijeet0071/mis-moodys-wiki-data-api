@@ -1,0 +1,151 @@
+/*
+  Define Pipeline Variable
+*/
+def userId = currentBuild.getBuildCauses()[0].userId
+def sonarBranch = env.BRANCH_NAME.replaceAll("/","_").replaceAll(" ","-")
+def sonarScanArgs=""
+def props
+def gitURLNohttp
+
+pipeline
+{
+    agent{node{label "mdp-aws-node-nprd"}}
+
+    options { 
+        disableConcurrentBuilds() 
+    }
+
+    tools {
+        jdk "JDK17.0.2"
+		maven "Maven-3.6.1"
+		gradle "gradle-7.3.3"
+    }
+
+    stages {
+        stage("Read Properties File") {
+            steps {
+                script {
+                    props = readProperties file: 'devops/ci/pipeline.properties'
+                    gitURLNohttp = props.gitRepo.split('//')[1]                  
+                }
+            }
+        }
+
+        stage("Source Code Fetch") {
+            steps {
+                echo "Source Code Fetch - started"
+                deleteDir()
+		        script{
+                checkout([$class: 'GitSCM', 
+                        branches: [[name: "${BRANCH_NAME}"]], 
+                        doGenerateSubmoduleConfigurations: false, 
+                        extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: "."]], 
+                        gitTool: 'Default', 
+                        submoduleCfg: [], 
+                        userRemoteConfigs: [[credentialsId: 'bitbucket-key', url: "${props.gitRepo}"]]])   
+                commitHashShort = env.GIT_COMMIT.take(7)
+                artifactVersion = "${sonarBranch}-${commitHashShort}-${env.BUILD_NUMBER}"
+                finalVersion = "dev-${artifactVersion}"
+			/*	withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'mlocal-bitbucketkey', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']])
+				{
+				  echo "gitURLNohttp=${gitURLNohttp}"
+				  sh """
+					git tag ${artifactVersion} ${GIT_COMMIT}
+					git push https://${USERNAME}:${PASSWORD}@${gitURLNohttp} --tags
+				  """
+				} */
+                echo "Source Code Fetch - completed"
+                }
+             }
+        }  
+
+        stage("Build") {
+            steps{
+                echo "Build - started"
+                echo "${commitHashShort}"
+                sh "chmod 777 ${WORKSPACE}/*"              
+                sh "./gradlew build"
+                echo "Build - completed"
+            }
+        }
+
+        stage("Sonar Scan"){
+            steps{
+                echo "Sonar Scan - started"    
+                script{ 
+                    if (env.BRANCH_NAME == 'master') {
+                        sonarScanArgsToBeUsed="${sonarScanArgs}"
+                    } else {
+                        sonarScanArgsToBeUsed="${sonarScanArgs} -Dsonar.branch.name=${sonarBranch}"
+                    }
+                }
+                withSonarQubeEnv('sonarqube-mdp-dev'){
+                    echo "${sonarScanArgsToBeUsed}"
+                    sh """
+                          gradle sonarqube \
+                                -Dsonar.verbose=true --info \
+                                -PgradleParamArtifactVersion=${artifactVersion} \
+                                -PgradleParamApplication=${props.application} \
+                                 ${sonarScanArgsToBeUsed} \
+                                -Dorg.gradle.daemon=false
+                    """
+                }
+                echo "Sonar Scan - completed"
+            }
+        }
+
+       stage("Quality Gate") {
+          steps {
+            echo "Quality Gate - started"
+             waitForQualityGate abortPipeline: true
+             echo "Quality Gate - completed"
+         }
+     	}
+
+		stage("Build Container Image") {      
+            steps {
+               	echo "Build Container Image - started"
+				sh """
+                   rm -rf ${WORKSPACE}/build/libs/*plain.jar
+                   aws ecr get-login-password --region ${props.awsRegion} | docker login --username AWS --password-stdin ${props.awsECR}
+				   docker build -t ${props.project}/${props.application}:${artifactVersion} .
+				   docker tag ${props.project}/${props.application}:${artifactVersion} ${props.awsECR}/${props.project}/${props.application}:${artifactVersion}
+				"""
+                script {
+                    currentBuild.description = finalVersion
+                }
+	            echo "Build Container Image - completed"
+            }
+		}      
+      
+		stage("Push Container Image to ECR") {
+            steps {
+               	echo "Push Container Image to ECR - started"
+				sh """
+					docker push ${props.awsECR}/${props.project}/${props.application}:${artifactVersion}
+				"""
+				echo "Push Container Image to ECR - completed"	
+			}
+		}    
+	}
+
+    post {
+        always {
+            echo "Pipeline Execution Completed"
+        }
+        success {
+            echo "Pipeline Execution Success"
+            mail from: 'jenkins@moodys.com',
+            subject: "${JOB_NAME} (${BUILD_NUMBER}) - CI Pipeline Status: Success",
+            body: "Started by user ${userId}\n\n${BUILD_URL}",
+            to: "${props.devTeamDistributionList}"
+        }
+        failure {
+            echo "Pipeline Execution Failure"
+            mail from: 'jenkins@moodys.com',
+            subject: "${JOB_NAME} (${BUILD_NUMBER}) - CI Pipeline Status: Failure",
+            body: "Started by user ${userId}\n\n${BUILD_URL}",
+            to: "${props.devTeamDistributionList}"
+        }
+    }
+}

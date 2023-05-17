@@ -1,0 +1,162 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APPLICATION_NAME}-${COLOR}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APPLICATION_NAME}
+    color: ${COLOR}
+    tier: api
+spec:
+  selector:
+    matchLabels:
+      app: ${APPLICATION_NAME}
+      color: ${COLOR}
+  replicas: ${REPLICAS}
+  template:
+    metadata:
+      labels:
+        app: ${APPLICATION_NAME}
+        color: ${COLOR}
+    spec:
+      serviceAccountName: ${PROJECT}-irsa
+      dnsPolicy: "ClusterFirst"
+      dnsConfig:
+        searches:
+          - ad.moodys.net
+      volumes:
+        - name: ${APPLICATION_NAME}-secret-${COLOR}
+          secret:
+            secretName: ${PROPERTIES_SECRET_NAME}
+            items:
+            - key: application.properties
+              path: application.properties
+        # - name: ${APPLICATION_NAME}-ssl-${COLOR}
+        #   secret:
+        #     secretName: ${SSL_SECRET_NAME}
+        - name: appd
+          emptyDir: {}
+      securityContext:
+        runAsUser: 1001
+      initContainers:
+      - command:
+        - /bin/sh
+        - -c
+        - pwd && ls -laR /sharedFiles/AppServerAgent && cp -r /sharedFiles/AppServerAgent /opt/spring/appd && ls -laR /opt/spring/appd
+        image: 443610414248.dkr.ecr.us-east-1.amazonaws.com/appdynamics/app-agent-java:latest
+        name: appd-java-agent
+        imagePullPolicy: Always
+        volumeMounts:
+          - name: appd
+            mountPath: /opt/spring/appd
+      containers:
+        - name: ${APPLICATION_NAME}-${COLOR}
+        # Build System to find and replace BUILD_IMAGE_ID with the ECR Image tag
+          image: ${BUILD_IMAGE}
+          resources:
+            limits:
+              memory: "2Gi"
+              cpu: "500m"
+            requests:
+              memory: "1Gi"
+              cpu: "200m"
+          volumeMounts: 
+            - mountPath: "/opt/spring/config"
+              name: ${APPLICATION_NAME}-secret-${COLOR}
+              readOnly: true
+            # - mountPath: "/opt/spring/etc"
+            #   name: ${APPLICATION_NAME}-ssl-${COLOR}
+            #   readOnly: true
+            - name: appd
+              mountPath: /opt/spring/appd
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true 
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: ${APPD_CONFIG_MAP_NAME}
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 30                
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 90
+            periodSeconds: 30
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/bash", "-c", "sleep 10"]
+          env:
+            - name: ENVIRONMENT
+              value: ${ENVIRONMENT}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APPLICATION_NAME}-svc-${COLOR}
+  labels:
+    app: ${APPLICATION_NAME}
+    color: ${COLOR}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${APPLICATION_NAME}
+    color: ${COLOR}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+      name: web
+  type: ClusterIP
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: ${APPLICATION_NAME}-${COLOR}-mw
+spec:
+  stripPrefix:
+    prefixes:
+      - /
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ${APPLICATION_NAME}-${COLOR}
+  namespace: ${NAMESPACE}
+  generation: 1
+spec:
+  entryPoints:
+  - web
+  - secure-proxy
+  routes:
+  - kind: Rule
+    match: Host(`${PROJECT}-${APPLICATION_NAME}-${ENVIRONMENT}-${AWS_REGION}.mis-ana-all-${ACCOUNT_ENV}.aws.moodys.tld`) || Host (`${PROJECT}-${APPLICATION_NAME}-${ENVIRONMENT}.mis-ana-all-${ACCOUNT_ENV}.aws.moodys.tld`)
+    middlewares:
+    - name: ${APPLICATION_NAME}-${COLOR}-mw
+    services:
+    - name: ${APPLICATION_NAME}-svc-${COLOR}
+      port: 80
+  # tls:
+  #   secretName: ${SSL_SECRET_NAME}
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: ${APPLICATION_NAME}-${COLOR}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ${APPLICATION_NAME}
+      color: ${COLOR}
+--- 

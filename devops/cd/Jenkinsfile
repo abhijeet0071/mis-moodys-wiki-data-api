@@ -1,0 +1,159 @@
+@Library('sharedlibs')_
+import groovy.transform.Field
+import hudson.util.Secret
+import com.cloudbees.plugins.credentials.CredentialsScope
+//import com.datapipe.jenkins.vault.credentials.VaultTokenCredential
+
+def userId = currentBuild.getBuildCauses()[0].userId
+
+def configVersion
+
+//def vaultToken
+//def vaultTokenCredential
+//def vaultConfiguration
+//def vaultSecrets =  
+/*[
+    [
+        path: "${params.VAULT_SECRET_PATH}",
+        engineVersion: 2,
+        secretValues: [
+            [envVar: 'CERT_KEY', vaultKey: 'key'],
+            [envVar: 'CERT_CER', vaultKey: 'cert']
+        ]
+    ]
+]*/
+
+@Field def props
+
+pipeline {
+    agent {
+        node {
+            label "${params.WORKER_NODE}"
+        }
+    }
+
+	environment {
+    	  awsSessionName = "MDP-Jenkins-${params.ENVIRONMENT}"
+	}
+    
+    stages {
+        stage("Read Properties File") {
+            steps {
+                script {
+                    props = readProperties file: 'devops/cd/pipeline.properties'
+                }
+            }
+        }
+
+        stage("Source Code Fetch") {
+            steps {
+                deleteDir()
+                checkout([$class: 'GitSCM', 
+                        branches: [[name: "${BRANCH_NAME}"]], 
+                        doGenerateSubmoduleConfigurations: false, 
+                        extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: "."]], 
+                        gitTool: 'Default', 
+                        submoduleCfg: [], 
+                        userRemoteConfigs: [[credentialsId: 'sys-BB-Read-Access', url: "${props.gitRepo}"]]])
+                script{
+                    def commitHashShort = env.GIT_COMMIT.take(7)
+                    def sonarBranch = env.BRANCH_NAME.replaceAll("/","-").replaceAll(" ","-")
+                    configVersion = "${sonarBranch}-${commitHashShort}-${env.BUILD_NUMBER}" 
+                }
+            }
+        }
+
+       stage("Deployment Approval"){
+						steps {
+								echo "Deployment Approval - started"
+								script{
+									release.approval(params.ENVIRONMENT)
+								      }
+								echo "Deployment Approval - completed"
+							}
+                                             }
+        stage("Deploy App: US-EAST-1") {
+            when {
+                expression {
+                    return params.DEPLOY_US_EAST_1
+                }
+            }
+            steps
+            {              
+                deploy('us-east-1', configVersion)
+            }
+        }
+
+        stage("Deploy App: US-WEST-2") {
+            when {
+                expression {                  
+                    return params.DEPLOY_US_WEST_2
+                }
+            }
+            steps 
+            {              
+                deploy('us-west-2', configVersion)
+            }
+        }
+    }    
+    post {
+        always {
+            echo "Pipeline Execution Completed"
+        }
+        success {
+            echo "Pipeline Execution Success"
+            mail from: "jenkins@moodys.com",
+            subject: "[${params.ENVIRONMENT}] ${JOB_NAME} (${BUILD_NUMBER}) - Invoke Pipeline Status: Success",
+            body: "Started by user ${userId}\n\n${BUILD_URL}",
+            to: "${props.devTeamDistributionList}"
+        }
+        failure {
+            echo "Pipeline Execution Failure"
+            mail from: "jenkins@moodys.com",
+            subject: "[${params.ENVIRONMENT}] ${JOB_NAME} (${BUILD_NUMBER}) - Invoke Pipeline Status: Failure",
+            body: "Started by user ${userId}\n\n${BUILD_URL}",
+            to: "${props.devTeamDistributionList}"
+        }
+    }
+}
+
+def deploy(String region, String configVersion) {
+                String loginScript = """
+                    export PATH=\${HOME}:\${PATH}
+                    export KUBECONFIG=\$HOME/.kube/"${props.project}"-config
+                    """ 
+                loginScript += """
+                    set +x
+                    source devops/scripts/assume-role.sh ${params.AWS_ROLE_ARN} ${props.awsSessionName}
+                    set -x
+                    aws sts get-caller-identity
+                """
+
+                loginScript += """
+                    export DB_USERNAME=\$(aws secretsmanager get-secret-value --secret-id "rad/${ENVIRONMENT}/rds/daw/pgs_${ENVIRONMENT}_daw_api-secret" | jq ".SecretString" --raw-output | jq ".username" --raw-output)
+                    export DB_PASSWORD=\$(aws secretsmanager get-secret-value --secret-id "rad/${ENVIRONMENT}/rds/daw/pgs_${ENVIRONMENT}_daw_api-secret" | jq ".SecretString" --raw-output | jq ".password" --raw-output)
+                """
+                
+                loginScript += """
+                    export AWS_REGION=$region
+                    aws eks --region \$AWS_REGION update-kubeconfig --name "${params.EKS_CLUSTER}-\${AWS_REGION}" --kubeconfig=/home/mdpusr/.kube/${props.project}-config
+                    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_EXPIRATION
+                """
+  
+                String propertiesSecretName = "${props.application}-application-yaml-${configVersion}".replaceAll('_','-')
+                String sslSecretName = "${props.application}-ssl-${configVersion}".replaceAll('_','-')
+                String appdynamicsConfigMapName = "${props.application}-appdynamics-${configVersion}".replaceAll('_','-')
+                String deployScript = """
+                    export ACCOUNT_ENV="${params.ENVIRONMENT == 'prd' ? 'prd' : 'nprd'}"
+                    export APPLICATION_NAME="${props.application}"
+                    export PROJECT="${props.project}"
+                    export BUILD_IMAGE="${props.awsECR}/${props.project}/${props.application}":"${params.IMAGE_TAG}"
+                    export NAMESPACE="${props.project}"-"${params.ENVIRONMENT}"
+                    export PROPERTIES_SECRET_NAME="${propertiesSecretName}"
+                    export SSL_SECRET_NAME="${sslSecretName}"
+                    export APPD_CONFIG_MAP_NAME="${appdynamicsConfigMapName}"
+    
+                    source ${WORKSPACE}/devops/scripts/kubectl_deploy.sh
+                """
+               sh loginScript + deployScript
+	}
